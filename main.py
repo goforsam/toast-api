@@ -1,116 +1,228 @@
+"""Toast Orders ETL - Fetch orders and load flattened fact_order_items to BigQuery"""
+
 import functions_framework
-import os
 import json
-import requests
+import logging
 from datetime import datetime, timedelta
-from google.cloud import bigquery
+from typing import Dict, List
 
-# Environment variables
-TOAST_CLIENT_ID = os.environ.get('TOAST_CLIENT_ID', '')
-TOAST_CLIENT_SECRET = os.environ.get('TOAST_CLIENT_SECRET', '')
-BQ_PROJECT_ID = os.environ.get('BQ_PROJECT_ID', 'possible-coast-439421-q5')
-BQ_DATASET_ID = os.environ.get('BQ_DATASET_ID', 'purpose')
-RESTAURANT_GUIDS = [g.strip() for g in os.environ.get('RESTAURANT_GUIDS', '').split(',')]
+# Shared modules
+from shared.config import SCHEMA_FACT_ORDER_ITEMS, RESTAURANT_GUIDS, BQ_PROJECT_ID, BQ_DATASET_ID
+from shared.secrets import get_secret
+from shared.toast_client import ToastAPIClient
+from shared.bigquery_utils import load_to_bigquery_with_dedup
+from shared.date_utils import normalize_timestamps
 
-MAX_PAGES = 1000
+# Configure structured logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def get_toast_token():
-    """Generate OAuth token from Toast API using machine client credentials"""
-    url = 'https://ws-api.toasttab.com/authentication/v1/authentication/login'
-    
-    payload = {
-        'clientId': TOAST_CLIENT_ID,
-        'clientSecret': TOAST_CLIENT_SECRET,
-        'userAccessType': 'TOAST_MACHINE_CLIENT'
-    }
-    
-    try:
-        print('Requesting Toast token...')
-        resp = requests.post(url, json=payload, timeout=10)
-        print(f'Token response: {resp.status_code}')
-        if resp.status_code == 200:
-            token_data = resp.json()
-            return token_data.get('token', {}).get('accessToken')
-        else:
-            print(f'Token error: {resp.text}')
-            return None
-    except Exception as e:
-        print(f'Token exception: {str(e)}')
-        return None
+
+def normalize_timestamp_value(value):
+    """Convert Toast API timestamp format (+0000) to BigQuery format (Z)"""
+    if value and isinstance(value, str):
+        if '+0000' in value:
+            return value.replace('+0000', 'Z')
+        elif '-0000' in value:
+            return value.replace('-0000', 'Z')
+    return value
+
+
+def flatten_order_to_items(order: Dict) -> List[Dict]:
+    """
+    Flatten order checks and selections to individual item rows
+
+    Args:
+        order: Order dict from Toast API with nested checks[] and selections[]
+
+    Returns:
+        List of flattened item dicts for fact_order_items table
+    """
+    items = []
+
+    for check in order.get('checks', []):
+        check_guid = check.get('guid')
+
+        for selection in check.get('selections', []):
+            # Extract nested menu item and sales category details (handle null values)
+            menu_item = selection.get('item') or {}
+            sales_category = selection.get('salesCategory') or {}
+
+            # Calculate prices
+            unit_price = selection.get('price', 0.0)
+            quantity = selection.get('quantity', 1.0)
+            total_price = unit_price * quantity
+
+            item = {
+                # Composite key
+                'selection_guid': selection.get('guid'),  # Primary dedup key
+                'order_guid': order.get('guid'),
+                'check_guid': check_guid,
+
+                # Dimension keys
+                'restaurant_guid': order.get('restaurantGuid'),
+                'business_date': order.get('businessDate'),  # Already normalized
+                'menu_item_guid': menu_item.get('guid'),
+                'sales_category_guid': sales_category.get('guid'),
+
+                # Denormalized dimension attributes (for BI speed)
+                'menu_item_name': menu_item.get('name'),
+                'sales_category_name': sales_category.get('name'),
+
+                # Measures
+                'quantity': quantity,
+                'unit_price': unit_price,
+                'total_price': total_price,
+                'tax_amount': selection.get('tax', 0.0),
+                'discount_amount': selection.get('appliedDiscounts', [{}])[0].get('discountAmount', 0.0) if selection.get('appliedDiscounts') else 0.0,
+
+                # Attributes
+                'is_voided': selection.get('voided', False),
+                'voided_date': normalize_timestamp_value(selection.get('voidDate')),
+                'modifiers': json.dumps(selection.get('modifiers', [])),  # Store as JSON string
+
+                # Timestamps
+                'created_date': normalize_timestamp_value(selection.get('createdDate')),
+                'modified_date': normalize_timestamp_value(selection.get('modifiedDate')),
+
+                # Metadata (standard across all fact tables)
+                '_loaded_at': datetime.utcnow().isoformat() + 'Z',
+                '_restaurant_guid': order.get('restaurantGuid'),
+                '_data_source': 'toast_api'
+            }
+
+            items.append(item)
+
+    return items
+
 
 @functions_framework.http
 def orders_daily(request):
-    """Fetch yesterday's orders from Toast API and load into BigQuery"""
-    
+    """
+    Cloud Function entry point: Fetch Toast orders and load flattened fact_order_items to BigQuery
+
+    Query parameters:
+    - start_date: YYYY-MM-DD (default: yesterday)
+    - end_date: YYYY-MM-DD (default: yesterday)
+    - mode: 'test' for dry-run without BigQuery load
+    - restaurant_guids: Optional list to filter specific restaurants
+
+    Returns:
+        JSON response with status and metrics
+    """
+
     try:
-        # Get token
-        token = get_toast_token()
-        if not token:
-            return 'Failed to get Toast token', 500
-        
-        print(f'Got token, fetching orders for {len(RESTAURANT_GUIDS)} restaurants')
-        
-        # Calculate yesterday's date range
-        yesterday = datetime.now() - timedelta(days=1)
-        start_date = yesterday.strftime('%Y-%m-%d')
-        end_date = yesterday.strftime('%Y-%m-%d')
-        
-        all_orders = []
-        
-        # Fetch orders for each restaurant
-        for guid in RESTAURANT_GUIDS:
+        # Parse request parameters
+        request_json = request.get_json(silent=True)
+        request_args = request.args
+
+        # Get date range
+        if request_json and 'start_date' in request_json:
+            start_date = request_json['start_date']
+            end_date = request_json.get('end_date', request_json['start_date'])
+        elif 'start_date' in request_args:
+            start_date = request_args['start_date']
+            end_date = request_args.get('end_date', start_date)
+        else:
+            # Default: yesterday
+            yesterday = datetime.now() - timedelta(days=1)
+            start_date = yesterday.strftime('%Y-%m-%d')
+            end_date = yesterday.strftime('%Y-%m-%d')
+
+        # Optional: Filter specific restaurants
+        if request_json and 'restaurant_guids' in request_json:
+            restaurant_guids = request_json['restaurant_guids']
+            if not isinstance(restaurant_guids, list):
+                restaurant_guids = [restaurant_guids]
+        else:
+            restaurant_guids = RESTAURANT_GUIDS
+
+        test_mode = (request_json and request_json.get('mode') == 'test') or request_args.get('mode') == 'test'
+
+        logger.info(f"Starting orders ETL: {start_date} to {end_date}, restaurants={len(restaurant_guids)}, test_mode={test_mode}")
+
+        # Get credentials from Secret Manager
+        client_id = get_secret('TOAST_CLIENT_ID')
+        client_secret = get_secret('TOAST_CLIENT_SECRET')
+
+        if not client_id or not client_secret:
+            return json.dumps({'error': 'Failed to retrieve credentials'}), 500, {'Content-Type': 'application/json'}
+
+        # Initialize Toast API client
+        toast_client = ToastAPIClient(client_id, client_secret)
+
+        all_items = []
+        all_errors = []
+        orders_fetched = 0
+
+        # Fetch orders for each restaurant with rate limiting
+        for guid in restaurant_guids:
             if not guid:
                 continue
-                
-            print(f'Fetching orders for restaurant: {guid}')
-            
-            page = 1
-            while page <= MAX_PAGES:
-                url = f'https://ws-api.toasttab.com/orders/v2/orders?startDate={start_date}&endDate={end_date}&page={page}&pageSize=100'
-                
-                headers = {
-                    'Authorization': f'Bearer {token}',
-                    'Toast-Restaurant-External-ID': guid
-                }
-                
-                resp = requests.get(url, headers=headers, timeout=30)
-                
-                if resp.status_code != 200:
-                    print(f'Error fetching page {page} for {guid}: {resp.status_code}')
-                    break
-                
-                data = resp.json()
-                orders = data.get('data', [])
-                
-                if not orders:
-                    print(f'No more orders for {guid} at page {page}')
-                    break
-                
-                print(f'Got {len(orders)} orders from page {page} for {guid}')
-                all_orders.extend(orders)
-                page += 1
-        
-        print(f'Total orders fetched: {len(all_orders)}')
-        
-        if not all_orders:
-            return 'No orders found for yesterday', 200
-        
-        # Load to BigQuery
-        client = bigquery.Client(project=BQ_PROJECT_ID)
-        table_id = f'{BQ_PROJECT_ID}.{BQ_DATASET_ID}.toast_orders_raw'
-        
-        job_config = bigquery.LoadJobConfig(
-            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-            autodetect=True
-        )
-        
-        job = client.load_table_from_json(all_orders, table_id, job_config=job_config)
-        job.result()
-        
-        print(f'Loaded {len(all_orders)} orders to BigQuery')
-        return f'Success: Loaded {len(all_orders)} orders', 200
-        
+
+            logger.info(f"Processing restaurant: {guid}")
+            orders, errors = toast_client.fetch_orders(guid, start_date, end_date)
+            orders_fetched += len(orders)
+            all_errors.extend(errors)
+
+            # Flatten orders to items (timestamps normalized inline)
+            for order in orders:
+                items = flatten_order_to_items(order)
+                all_items.extend(items)
+
+        logger.info(f"Total orders fetched: {orders_fetched}, items extracted: {len(all_items)}, errors: {len(all_errors)}")
+
+        if not all_items:
+            result = {
+                'status': 'success',
+                'message': f'No items found for {start_date} to {end_date}',
+                'orders_fetched': orders_fetched,
+                'items_loaded': 0,
+                'duplicates_skipped': 0,
+                'errors': all_errors
+            }
+            return json.dumps(result), 200, {'Content-Type': 'application/json'}
+
+        # Load to BigQuery with deduplication
+        if not test_mode:
+            table_id = f'{BQ_PROJECT_ID}.{BQ_DATASET_ID}.fact_order_items'
+
+            rows_loaded, load_errors = load_to_bigquery_with_dedup(
+                all_items,
+                table_id,
+                schema=SCHEMA_FACT_ORDER_ITEMS,
+                dedup_key='selection_guid'
+            )
+
+            all_errors.extend(load_errors)
+            duplicates_skipped = len(all_items) - rows_loaded
+
+            logger.info(f"BigQuery load complete: {rows_loaded} new items, {duplicates_skipped} duplicates")
+
+            result = {
+                'status': 'success' if not load_errors else 'partial',
+                'orders_fetched': orders_fetched,
+                'items_loaded': rows_loaded,
+                'duplicates_skipped': duplicates_skipped,
+                'errors': all_errors
+            }
+        else:
+            # Test mode: just return metrics without loading
+            result = {
+                'status': 'test_mode',
+                'orders_fetched': orders_fetched,
+                'items_extracted': len(all_items),
+                'errors': all_errors
+            }
+
+        return json.dumps(result), 200, {'Content-Type': 'application/json'}
+
     except Exception as e:
-        print(f'Error: {str(e)}')
-        return f'Error: {str(e)}', 500
+        error_msg = f'Critical error: {str(e)}'
+        logger.exception(error_msg)
+
+        result = {
+            'status': 'error',
+            'message': error_msg
+        }
+        return json.dumps(result), 500, {'Content-Type': 'application/json'}
