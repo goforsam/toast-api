@@ -50,10 +50,10 @@ gcloud functions describe $FUNCTION_NAME \
 # Copy current local files to backup
 cp main.py "$BACKUP_DIR/main.py.old" 2>/dev/null || echo "No main.py to backup"
 
-# Use improved version
+# Use complete version (loads ALL data sources: orders, cash, labor)
 echo ""
-echo "Preparing improved version..."
-cp main_improved.py main.py
+echo "Using main_complete.py (orders + cash + labor)..."
+cp main_complete.py main.py
 
 # Deploy function
 echo ""
@@ -66,13 +66,13 @@ gcloud functions deploy $FUNCTION_NAME \
     --runtime=$RUNTIME \
     --region=$REGION \
     --source=. \
-    --entry-point=$ENTRY_POINT \
+    --entry-point=load_all_data \
     --trigger-http \
     --allow-unauthenticated \
     --timeout=540s \
-    --memory=512MB \
+    --memory=2GB \
     --max-instances=10 \
-    --set-env-vars BQ_DATASET_ID=toast
+    --set-env-vars BQ_DATASET_ID=purpose
 
 echo ""
 echo "================================"

@@ -1,113 +1,195 @@
-"""BigQuery loading utilities with MERGE deduplication pattern"""
+"""BigQuery loading utilities with staging table + load job deduplication"""
 
+import json
+import tempfile
 import time
 import logging
 from typing import Dict, List, Tuple
 from google.cloud import bigquery
 
-from .config import BQ_PROJECT_ID
+from .config import BQ_PROJECT_ID, BQ_DATASET_ID
 
 logger = logging.getLogger(__name__)
 
 
-def load_to_bigquery_with_dedup(
+def get_table_id(table_name: str) -> str:
+    """Build fully qualified table ID"""
+    return f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}"
+
+
+def load_to_bigquery(
     records: List[Dict],
-    table_id: str,
-    schema: List[bigquery.SchemaField] = None,
-    dedup_key: str = None
+    table_name: str,
+    schema: List[bigquery.SchemaField],
+    dedup_keys: List[str],
 ) -> Tuple[int, List[str]]:
     """
-    Load records to BigQuery with deduplication using MERGE
+    Load records to BigQuery using staging table + load job with deduplication.
+
+    Flow:
+    1. Write records to NDJSON temp file
+    2. BigQuery load job into staging table (free, no streaming cost)
+    3. INSERT INTO fact SELECT * FROM staging WHERE NOT EXISTS (dedup on keys)
+    4. Drop staging table
 
     Args:
-        records: List of record dicts
-        table_id: Fully qualified table ID (project.dataset.table)
-        schema: BigQuery schema (optional, uses table's existing schema if not provided)
-        dedup_key: Primary key field name for deduplication (default: 'guid')
+        records: List of record dicts to load
+        table_name: Short table name (e.g., 'fact_order_items')
+        schema: BigQuery schema fields
+        dedup_keys: List of column names for deduplication
 
     Returns:
-        Tuple of (rows loaded, errors list)
+        Tuple of (rows_inserted, errors_list)
     """
     if not records:
         return 0, []
 
-    if dedup_key is None:
-        dedup_key = 'guid'
-
     errors = []
     client = bigquery.Client(project=BQ_PROJECT_ID)
+    table_id = get_table_id(table_name)
+    staging_id = f"{table_id}_staging_{int(time.time())}"
 
     try:
-        # Load to temporary staging table
-        temp_table_id = f"{table_id}_temp_{int(time.time())}"
+        # Step 1: Ensure main table exists
+        _ensure_table_exists(client, table_id, schema)
 
-        # Use provided schema or fetch from existing table
-        if schema is None:
-            try:
-                table = client.get_table(table_id)
-                schema = table.schema
-            except Exception:
-                raise ValueError(f"No schema provided and table {table_id} doesn't exist")
+        # Step 2: Write NDJSON to temp file and load into staging table
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            for record in records:
+                f.write(json.dumps(record, default=str) + '\n')
+            temp_path = f.name
 
         job_config = bigquery.LoadJobConfig(
             schema=schema,
-            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
             source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         )
 
-        logger.info(f"Loading {len(records)} records to staging table {temp_table_id}")
-        load_job = client.load_table_from_json(records, temp_table_id, job_config=job_config)
-        load_job.result()
+        with open(temp_path, 'rb') as f:
+            load_job = client.load_table_from_file(f, staging_id, job_config=job_config)
+            load_job.result()
 
-        # Ensure main table exists with correct schema before MERGE
-        try:
-            table = client.get_table(table_id)
-            # Check if schema matches (column count)
-            if len(table.schema) != len(schema):
-                logger.warning(f"Schema mismatch: table has {len(table.schema)} columns, expected {len(schema)}. Recreating table.")
-                client.delete_table(table_id)
-                table = bigquery.Table(table_id, schema=schema)
-                client.create_table(table)
-                logger.info(f"Recreated table {table_id} with correct schema")
-            else:
-                logger.info(f"Main table {table_id} exists with correct schema")
-        except Exception as e:
-            logger.info(f"Creating main table {table_id} with {len(schema)} columns")
-            table = bigquery.Table(table_id, schema=schema)
-            client.create_table(table)
+        staging_rows = load_job.output_rows
+        logger.info(f"Loaded {staging_rows} rows into staging table")
 
-        # MERGE from staging to main table (deduplication)
-        # Support composite keys if dedup_key contains comma
-        if ',' in dedup_key:
-            # Composite key (e.g., "guid,restaurantGuid")
-            keys = [k.strip() for k in dedup_key.split(',')]
-            on_condition = ' AND '.join([f'T.{k} = S.{k}' for k in keys])
-        else:
-            # Single key
-            on_condition = f'T.{dedup_key} = S.{dedup_key}'
+        # Step 3: INSERT with dedup (only rows that don't already exist)
+        on_condition = ' AND '.join(
+            [f'main.{k} = staging.{k}' for k in dedup_keys]
+        )
 
-        merge_query = f"""
-        MERGE `{table_id}` T
-        USING `{temp_table_id}` S
-        ON {on_condition}
-        WHEN NOT MATCHED THEN
-          INSERT ROW
+        insert_query = f"""
+        INSERT INTO `{table_id}`
+        SELECT staging.*
+        FROM `{staging_id}` AS staging
+        WHERE NOT EXISTS (
+            SELECT 1 FROM `{table_id}` AS main
+            WHERE {on_condition}
+        )
         """
 
-        logger.info(f"Merging data to {table_id} with deduplication on {dedup_key}")
-        merge_job = client.query(merge_query)
-        merge_job.result()
+        logger.info(f"Dedup insert into {table_name} on keys: {dedup_keys}")
+        query_job = client.query(insert_query)
+        query_job.result()
 
-        rows_affected = merge_job.num_dml_affected_rows or 0
+        rows_inserted = query_job.num_dml_affected_rows or 0
+        duplicates_skipped = staging_rows - rows_inserted
 
-        # Clean up temp table
-        client.delete_table(temp_table_id, not_found_ok=True)
+        logger.info(f"Inserted {rows_inserted} new rows, skipped {duplicates_skipped} duplicates")
 
-        logger.info(f"Successfully loaded {rows_affected} new records (deduplicated)")
-        return rows_affected, errors
+        # Step 4: Drop staging table
+        client.delete_table(staging_id, not_found_ok=True)
+
+        return rows_inserted, errors
 
     except Exception as e:
         error_msg = f"BigQuery load error: {str(e)}"
         logger.error(error_msg)
         errors.append(error_msg)
+        # Clean up staging table on error
+        try:
+            client.delete_table(staging_id, not_found_ok=True)
+        except Exception:
+            pass
         return 0, errors
+
+
+def load_dimension_to_bigquery(
+    records: List[Dict],
+    table_name: str,
+    schema: List[bigquery.SchemaField],
+) -> Tuple[int, List[str]]:
+    """
+    Load dimension records using full refresh (WRITE_TRUNCATE).
+
+    Replaces the entire table contents each run. Used for dimension tables
+    that represent current state (employees, jobs, restaurants).
+
+    Args:
+        records: List of record dicts to load
+        table_name: Short table name (e.g., 'dim_employees')
+        schema: BigQuery schema fields
+
+    Returns:
+        Tuple of (rows_loaded, errors_list)
+    """
+    if not records:
+        return 0, []
+
+    errors = []
+    client = bigquery.Client(project=BQ_PROJECT_ID)
+    table_id = get_table_id(table_name)
+
+    try:
+        # Ensure table exists
+        _ensure_table_exists(client, table_id, schema)
+
+        # Write NDJSON to temp file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            for record in records:
+                f.write(json.dumps(record, default=str) + '\n')
+            temp_path = f.name
+
+        job_config = bigquery.LoadJobConfig(
+            schema=schema,
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
+
+        with open(temp_path, 'rb') as f:
+            load_job = client.load_table_from_file(f, table_id, job_config=job_config)
+            load_job.result()
+
+        rows_loaded = load_job.output_rows
+        logger.info(f"Dimension refresh: {rows_loaded} rows loaded to {table_name}")
+        return rows_loaded, errors
+
+    except Exception as e:
+        error_msg = f"BigQuery dimension load error: {str(e)}"
+        logger.error(error_msg)
+        errors.append(error_msg)
+        return 0, errors
+
+
+def _ensure_table_exists(
+    client: bigquery.Client,
+    table_id: str,
+    schema: List[bigquery.SchemaField],
+):
+    """Create table if it doesn't exist, with partitioning and clustering."""
+    try:
+        client.get_table(table_id)
+    except Exception:
+        logger.info(f"Creating table {table_id}")
+        table = bigquery.Table(table_id, schema=schema)
+
+        field_names = [f.name for f in schema]
+        if 'business_date' in field_names:
+            table.time_partitioning = bigquery.TimePartitioning(
+                type_=bigquery.TimePartitioningType.DAY,
+                field='business_date',
+            )
+        if 'restaurant_guid' in field_names:
+            table.clustering_fields = ['restaurant_guid']
+
+        client.create_table(table)
+        logger.info(f"Created table {table_id} with {len(schema)} columns")

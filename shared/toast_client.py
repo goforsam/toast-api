@@ -221,3 +221,272 @@ class ToastAPIClient:
                 break
 
         return orders, errors
+
+    def _fetch_cash_endpoint(self, endpoint_path: str, restaurant_guid: str,
+                              start_date: str, end_date: str) -> Tuple[List[Dict], List[str]]:
+        """
+        Fetch from a cash management endpoint, iterating by business date.
+
+        Cash API uses businessDate=YYYYMMDD (single day), not date ranges.
+        """
+        entries = []
+        errors = []
+
+        token = self.get_token()
+        if not token:
+            errors.append(f"No valid token for {restaurant_guid}")
+            return entries, errors
+
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Toast-Restaurant-External-ID': restaurant_guid,
+        }
+
+        current = datetime.strptime(start_date, '%Y-%m-%d')
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+
+        while current <= end_dt:
+            biz_date = current.strftime('%Y%m%d')
+
+            self._apply_rate_limit('cash', restaurant_guid)
+
+            url = f'https://ws-api.toasttab.com{endpoint_path}?businessDate={biz_date}'
+
+            try:
+                logger.info(f"Fetching {endpoint_path} for {restaurant_guid} date={biz_date}")
+                resp = self.session.get(url, headers=headers, timeout=30)
+
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get('Retry-After', 60))
+                    logger.warning(f"Rate limited. Waiting {retry_after}s")
+                    time.sleep(retry_after)
+                    continue
+
+                resp.raise_for_status()
+
+                data = resp.json()
+                page_entries = data if isinstance(data, list) else data.get('data', [])
+
+                if page_entries:
+                    # Tag each entry with the business date we queried
+                    for entry in page_entries:
+                        if 'businessDate' not in entry or not entry['businessDate']:
+                            entry['businessDate'] = int(biz_date)
+                    logger.info(f"Got {len(page_entries)} entries for {biz_date}")
+                    entries.extend(page_entries)
+
+            except requests.exceptions.RequestException as e:
+                error_msg = f"Error fetching {endpoint_path} date={biz_date} for {restaurant_guid}: {str(e)}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+
+            current += timedelta(days=1)
+
+        return entries, errors
+
+    def fetch_cash_entries(self, restaurant_guid: str, start_date: str, end_date: str) -> Tuple[List[Dict], List[str]]:
+        """Fetch cash drawer entries for a restaurant by date range."""
+        return self._fetch_cash_endpoint('/cashmgmt/v1/entries', restaurant_guid, start_date, end_date)
+
+    def fetch_cash_deposits(self, restaurant_guid: str, start_date: str, end_date: str) -> Tuple[List[Dict], List[str]]:
+        """Fetch cash deposits for a restaurant by date range."""
+        return self._fetch_cash_endpoint('/cashmgmt/v1/deposits', restaurant_guid, start_date, end_date)
+
+    def fetch_labor_time_entries(self, restaurant_guid: str, start_date: str, end_date: str) -> Tuple[List[Dict], List[str]]:
+        """
+        Fetch labor time entries for a restaurant by date range.
+
+        Uses /labor/v1/timeEntries with startDate/endDate query params.
+        """
+        entries = []
+        errors = []
+
+        token = self.get_token()
+        if not token:
+            errors.append(f"No valid token for {restaurant_guid}")
+            return entries, errors
+
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Toast-Restaurant-External-ID': restaurant_guid,
+        }
+
+        self._apply_rate_limit('labor', restaurant_guid)
+
+        # Labor API uses ISO date format for date range
+        start_datetime = f'{start_date}T00:00:00.000-0000'
+        end_datetime = f'{end_date}T23:59:59.999-0000'
+        url = f'https://ws-api.toasttab.com/labor/v1/timeEntries?startDate={start_datetime}&endDate={end_datetime}'
+
+        try:
+            logger.info(f"Fetching labor time entries for {restaurant_guid} {start_date} to {end_date}")
+            resp = self.session.get(url, headers=headers, timeout=60)
+
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get('Retry-After', 60))
+                logger.warning(f"Rate limited. Waiting {retry_after}s")
+                time.sleep(retry_after)
+                resp = self.session.get(url, headers=headers, timeout=60)
+
+            resp.raise_for_status()
+
+            data = resp.json()
+            page_entries = data if isinstance(data, list) else data.get('data', [])
+
+            logger.info(f"Got {len(page_entries)} labor entries for {restaurant_guid}")
+            entries.extend(page_entries)
+
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Error fetching labor for {restaurant_guid}: {str(e)}"
+            logger.error(error_msg)
+            errors.append(error_msg)
+
+        return entries, errors
+
+    def _fetch_config_endpoint(self, endpoint_path: str, restaurant_guid: str,
+                                rate_key: str = 'config') -> Tuple[List[Dict], List[str]]:
+        """
+        Fetch from a config/dimension endpoint (no date params).
+
+        Returns current snapshot of config data for a restaurant.
+        """
+        entries = []
+        errors = []
+
+        token = self.get_token()
+        if not token:
+            errors.append(f"No valid token for {restaurant_guid}")
+            return entries, errors
+
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Toast-Restaurant-External-ID': restaurant_guid,
+        }
+
+        self._apply_rate_limit(rate_key, restaurant_guid)
+
+        url = f'https://ws-api.toasttab.com{endpoint_path}'
+
+        try:
+            logger.info(f"Fetching {endpoint_path} for {restaurant_guid}")
+            resp = self.session.get(url, headers=headers, timeout=60)
+
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get('Retry-After', 60))
+                logger.warning(f"Rate limited. Waiting {retry_after}s")
+                time.sleep(retry_after)
+                resp = self.session.get(url, headers=headers, timeout=60)
+
+            resp.raise_for_status()
+
+            data = resp.json()
+            page_entries = data if isinstance(data, list) else data.get('data', [])
+
+            logger.info(f"Got {len(page_entries)} items from {endpoint_path} for {restaurant_guid}")
+            entries.extend(page_entries)
+
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Error fetching {endpoint_path} for {restaurant_guid}: {str(e)}"
+            logger.error(error_msg)
+            errors.append(error_msg)
+
+        return entries, errors
+
+    def fetch_menus(self, restaurant_guid: str) -> Tuple[List[Dict], List[str]]:
+        """Fetch all menus for a restaurant. Uses 'menus' rate limit (60s)."""
+        entries = []
+        errors = []
+
+        token = self.get_token()
+        if not token:
+            errors.append(f"No valid token for {restaurant_guid}")
+            return entries, errors
+
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Toast-Restaurant-External-ID': restaurant_guid,
+        }
+
+        self._apply_rate_limit('menus', restaurant_guid)
+
+        url = 'https://ws-api.toasttab.com/menus/v2/menus'
+
+        try:
+            logger.info(f"Fetching menus for {restaurant_guid}")
+            resp = self.session.get(url, headers=headers, timeout=60)
+
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get('Retry-After', 60))
+                logger.warning(f"Rate limited on menus. Waiting {retry_after}s")
+                time.sleep(retry_after)
+                resp = self.session.get(url, headers=headers, timeout=60)
+
+            resp.raise_for_status()
+
+            data = resp.json()
+            logger.info(f"Menus response type: {type(data).__name__}, keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}, len: {len(data)}")
+
+            if isinstance(data, list):
+                entries = data
+            elif isinstance(data, dict):
+                # Try common wrapper keys
+                entries = data.get('menus', data.get('data', [data]))
+
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Error fetching menus for {restaurant_guid}: {str(e)}"
+            logger.error(error_msg)
+            errors.append(error_msg)
+
+        return entries, errors
+
+    def fetch_employees(self, restaurant_guid: str) -> Tuple[List[Dict], List[str]]:
+        """Fetch all employees for a restaurant."""
+        return self._fetch_config_endpoint('/labor/v1/employees', restaurant_guid, 'config')
+
+    def fetch_jobs(self, restaurant_guid: str) -> Tuple[List[Dict], List[str]]:
+        """Fetch all jobs for a restaurant."""
+        return self._fetch_config_endpoint('/labor/v1/jobs', restaurant_guid, 'config')
+
+    def fetch_restaurant_info(self, restaurant_guid: str) -> Tuple[List[Dict], List[str]]:
+        """Fetch restaurant info. Returns single-item list for consistency."""
+        entries = []
+        errors = []
+
+        token = self.get_token()
+        if not token:
+            errors.append(f"No valid token for {restaurant_guid}")
+            return entries, errors
+
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Toast-Restaurant-External-ID': restaurant_guid,
+        }
+
+        self._apply_rate_limit('config', restaurant_guid)
+
+        url = f'https://ws-api.toasttab.com/restaurants/v1/restaurants/{restaurant_guid}'
+
+        try:
+            logger.info(f"Fetching restaurant info for {restaurant_guid}")
+            resp = self.session.get(url, headers=headers, timeout=30)
+
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get('Retry-After', 60))
+                logger.warning(f"Rate limited. Waiting {retry_after}s")
+                time.sleep(retry_after)
+                resp = self.session.get(url, headers=headers, timeout=30)
+
+            resp.raise_for_status()
+
+            data = resp.json()
+            if isinstance(data, dict):
+                entries.append(data)
+            elif isinstance(data, list):
+                entries.extend(data)
+
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Error fetching restaurant info for {restaurant_guid}: {str(e)}"
+            logger.error(error_msg)
+            errors.append(error_msg)
+
+        return entries, errors
