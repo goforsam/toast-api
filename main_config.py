@@ -14,6 +14,7 @@ import functions_framework
 
 from shared.config import (
     RESTAURANT_GUIDS,
+    SECRET_SUFFIX,
     SCHEMA_DIM_RESTAURANTS,
     SCHEMA_DIM_EMPLOYEES,
     SCHEMA_DIM_JOBS,
@@ -155,8 +156,8 @@ def config_weekly(request):
 
         logger.info(f"Config ETL: {len(guids)} restaurant(s)")
 
-        client_id = get_secret('TOAST_CLIENT_ID')
-        client_secret = get_secret('TOAST_CLIENT_SECRET')
+        client_id = get_secret(f'TOAST_CLIENT_ID{SECRET_SUFFIX}')
+        client_secret = get_secret(f'TOAST_CLIENT_SECRET{SECRET_SUFFIX}')
         if not client_id or not client_secret:
             return _error_response('Failed to retrieve Toast credentials'), 500
 

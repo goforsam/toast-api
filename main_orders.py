@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 import functions_framework
 
-from shared.config import RESTAURANT_GUIDS, SCHEMA_FACT_ORDER_ITEMS
+from shared.config import RESTAURANT_GUIDS, SCHEMA_FACT_ORDER_ITEMS, SECRET_SUFFIX
 from shared.secrets_utils import get_secret
 from shared.toast_client import ToastAPIClient
 from shared.bigquery_utils import load_to_bigquery
@@ -123,8 +123,8 @@ def orders_daily(request):
         logger.info(f"Orders ETL: {len(guids)} restaurant(s), {start_date} to {end_date}")
 
         # Get Toast credentials
-        client_id = get_secret('TOAST_CLIENT_ID')
-        client_secret = get_secret('TOAST_CLIENT_SECRET')
+        client_id = get_secret(f'TOAST_CLIENT_ID{SECRET_SUFFIX}')
+        client_secret = get_secret(f'TOAST_CLIENT_SECRET{SECRET_SUFFIX}')
         if not client_id or not client_secret:
             return _error_response('Failed to retrieve Toast credentials'), 500
 

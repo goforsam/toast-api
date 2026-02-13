@@ -6,6 +6,7 @@ from google.cloud import bigquery
 # Environment configuration
 BQ_PROJECT_ID = os.environ.get('BQ_PROJECT_ID', 'possible-coast-439421-q5')
 BQ_DATASET_ID = os.environ.get('BQ_DATASET_ID', 'purpose')
+SECRET_SUFFIX = os.environ.get('SECRET_SUFFIX', '')  # '' for purpose, '_RODRIGOS' for rodrigos
 
 # API Configuration
 MAX_PAGES = 100
@@ -21,8 +22,8 @@ RATE_LIMITS = {
     'config': 3     # 20 req/sec
 }
 
-# Restaurant GUIDs (13 locations)
-RESTAURANT_GUIDS = [
+# Restaurant GUIDs - overridable via env var (comma-separated)
+_DEFAULT_GUIDS = [
     '6d035dad-924f-47b4-ba93-fd86575e73a3',
     '53ae28f1-87c7-4a07-9a43-b619c009b7b0',
     'def5e222-f458-41d0-bff9-48abaf20666a',
@@ -37,6 +38,8 @@ RESTAURANT_GUIDS = [
     'a4b4a7a2-0309-4451-8b62-ca0c98858a84',
     'd44d5122-3412-459a-946d-f91a5da03ea3'
 ]
+_guid_csv = os.environ.get('RESTAURANT_GUIDS_CSV', '')
+RESTAURANT_GUIDS = [g.strip() for g in _guid_csv.split(',') if g.strip()] if _guid_csv else _DEFAULT_GUIDS
 
 # --- BigQuery Schemas ---
 
