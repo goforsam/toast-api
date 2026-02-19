@@ -49,6 +49,19 @@ CLIENT_CONFIGS = {
             '1903fd30-c0ff-4682-b9af-b184c77d9653',
         ],
     },
+    'slim_husky': {
+        'prefix': 'slim',
+        'guids': [
+            '9ee73d8b-7d6d-4227-b005-9a3e6e749dbe',  # Atlanta/Metropolitan
+            'cd8c8f17-7868-4281-97a1-589c0b0799e4',  # Memphis/Downtown
+            '89674e99-65bb-4855-998c-c6eee25fe032',  # Nashville/Antioch
+            'c50c9ccc-7cb9-42e9-8359-04414258eb6a',  # Nashville/Buchanan Arts District
+            'dfcda609-9262-4181-9b26-a9db7a87c2ea',  # Nashville/5th + Broadway
+            '2fe1af2a-1021-4b80-b060-4b70fad83e9b',  # Franklin
+            'b00be8e0-a7d9-4a90-a4e2-3d8191a86796',  # Murfreesboro/MTSU
+            '6371f5c4-a26b-49ba-943a-c27178a21dad',  # Nashville/Belmont Univ
+        ],
+    },
 }
 
 # URL hash is project-level (same for all functions in the project)
@@ -128,7 +141,7 @@ def main():
     parser = argparse.ArgumentParser(description='Toast ETL Historical Backfill')
     parser.add_argument('--type', required=True, choices=['orders', 'cash', 'labor'],
                         help='ETL type to backfill')
-    parser.add_argument('--dataset', default='purpose', choices=list(CLIENT_CONFIGS.keys()),
+    parser.add_argument('--dataset', default='purpose', choices=list(CLIENT_CONFIGS.keys()),  # purpose, rodrigos, slim_husky
                         help='Target dataset/client (default: purpose)')
     parser.add_argument('--start', default='2025-01-01', help='Start date (YYYY-MM-DD)')
     parser.add_argument('--end', default=None, help='End date (YYYY-MM-DD, default: yesterday)')
