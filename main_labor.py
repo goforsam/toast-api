@@ -107,9 +107,7 @@ def labor_daily(request):
         if not end_date:
             end_date = start_date
 
-        if not restaurant_guid:
-            return _error_response('restaurant_guid is required'), 400
-        elif restaurant_guid == 'ALL':
+        if not restaurant_guid or restaurant_guid == 'ALL':
             guids = RESTAURANT_GUIDS
         else:
             guids = [restaurant_guid]
@@ -175,4 +173,4 @@ def labor_daily(request):
 
 
 def _error_response(message):
-    return json.dumps({'status': 'error', 'error': message}), {'Content-Type': 'application/json'}
+    return json.dumps({'status': 'error', 'error': message})
