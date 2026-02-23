@@ -2,11 +2,14 @@
 
 import os
 from google.cloud import bigquery
+from .clients import CLIENTS
 
-# Environment configuration
+# Active client is selected via CLIENT_NAME env var; all other config derived from shared/clients.py
 BQ_PROJECT_ID = os.environ.get('BQ_PROJECT_ID', 'possible-coast-439421-q5')
-BQ_DATASET_ID = os.environ.get('BQ_DATASET_ID', 'purpose')
-SECRET_SUFFIX = os.environ.get('SECRET_SUFFIX', '')  # '' for purpose, '_RODRIGOS' for rodrigos
+_CLIENT_NAME = os.environ.get('CLIENT_NAME', 'purpose')
+_client = CLIENTS[_CLIENT_NAME]
+BQ_DATASET_ID = _client['bq_dataset_id']
+SECRET_SUFFIX = _client['secret_suffix']
 
 # API Configuration
 MAX_PAGES = 100
@@ -22,24 +25,8 @@ RATE_LIMITS = {
     'config': 3     # 20 req/sec
 }
 
-# Restaurant GUIDs - overridable via env var (comma-separated)
-_DEFAULT_GUIDS = [
-    '6d035dad-924f-47b4-ba93-fd86575e73a3',
-    '53ae28f1-87c7-4a07-9a43-b619c009b7b0',
-    'def5e222-f458-41d0-bff9-48abaf20666a',
-    '42f246b1-82f1-4048-93c1-d63554c7d9ef',
-    'a405942e-179b-4f3f-a75b-a0d18882bd7f',
-    'd587bfe9-9faa-48a8-9938-1a23ad36bc9e',
-    'da6f0893-d17c-4f93-b7ee-0c708d2611a9',
-    'a6a87c64-734e-4f39-90dc-598b5e743105',
-    'e629b6e6-85f5-466f-9427-cfbb4f2a6bfe',
-    '290ca643-8ee4-4d8f-9c70-3793e15ae8a6',
-    'eaa7b168-db38-45be-82e8-bd25e6647fd1',
-    'a4b4a7a2-0309-4451-8b62-ca0c98858a84',
-    'd44d5122-3412-459a-946d-f91a5da03ea3'
-]
-_guid_csv = os.environ.get('RESTAURANT_GUIDS_CSV', '')
-RESTAURANT_GUIDS = [g.strip() for g in _guid_csv.split(',') if g.strip()] if _guid_csv else _DEFAULT_GUIDS
+# Restaurant GUIDs sourced from shared/clients.py (single source of truth)
+RESTAURANT_GUIDS = _client['restaurant_guids']
 
 # --- BigQuery Schemas ---
 

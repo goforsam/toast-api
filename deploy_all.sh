@@ -16,25 +16,15 @@ for arg in "$@"; do
     esac
 done
 
-# Client config per dataset
+# PREFIX is the Cloud Function name prefix (e.g. "toast", "rodrigos", "slim").
+# All other config (dataset, secret suffix, GUIDs) is resolved in Python via CLIENT_NAME -> shared/clients.py.
+# To add a new client: add it to shared/clients.py, then add one line here.
 case $DATASET in
-    purpose)
-        PREFIX="toast"
-        SECRET_SUFFIX=""
-        GUIDS_CSV=""
-        ;;
-    rodrigos)
-        PREFIX="rodrigos"
-        SECRET_SUFFIX="_RODRIGOS"
-        GUIDS_CSV="ab3c4f80-5529-4b5f-bba1-cc9abaf33431,3383074f-b565-4501-ae86-41f21c866cba,8cb95c1f-2f82-4f20-9dce-446a956fd4bb,bef05e5c-3b38-49f3-9b8d-ca379130f718,8c37412b-a13b-4edd-bbd8-b26222fcbe68,dedecf4f-ee34-41ab-a740-f3b461eed4eb,eea6e77a-46b2-4631-907e-10d85a845bb8,e2fbc555-2cc4-49ee-bbdc-1e4c652ec6f4,d0bbc362-63d4-4277-af85-2bf2c808bdc7,1903fd30-c0ff-4682-b9af-b184c77d9653"
-        ;;
-    slim_husky)
-        PREFIX="slim"
-        SECRET_SUFFIX="_SLIM"
-        GUIDS_CSV="9ee73d8b-7d6d-4227-b005-9a3e6e749dbe,cd8c8f17-7868-4281-97a1-589c0b0799e4,89674e99-65bb-4855-998c-c6eee25fe032,c50c9ccc-7cb9-42e9-8359-04414258eb6a,dfcda609-9262-4181-9b26-a9db7a87c2ea,2fe1af2a-1021-4b80-b060-4b70fad83e9b,b00be8e0-a7d9-4a90-a4e2-3d8191a86796,6371f5c4-a26b-49ba-943a-c27178a21dad"
-        ;;
+    purpose)    PREFIX="toast" ;;
+    rodrigos)   PREFIX="rodrigos" ;;
+    slim_husky) PREFIX="slim" ;;
     *)
-        echo "ERROR: Unknown dataset '$DATASET'. Use: purpose, rodrigos, slim_husky"
+        echo "ERROR: Unknown dataset '$DATASET'. Add it to shared/clients.py first."
         exit 1
         ;;
 esac
@@ -61,11 +51,8 @@ deploy_function() {
     echo "  Memory: $memory"
     echo ""
 
-    # Use ^;;^ delimiter so commas in GUIDS_CSV don't break gcloud parsing
-    local env_vars="^;;^BQ_DATASET_ID=${DATASET};;SECRET_SUFFIX=${SECRET_SUFFIX}"
-    if [ -n "$GUIDS_CSV" ]; then
-        env_vars="${env_vars};;RESTAURANT_GUIDS_CSV=${GUIDS_CSV}"
-    fi
+    # CLIENT_NAME is the only env var needed; all other config resolved in shared/clients.py
+    local env_vars="CLIENT_NAME=${DATASET}"
 
     gcloud functions deploy "$func_name" \
         --gen2 \
