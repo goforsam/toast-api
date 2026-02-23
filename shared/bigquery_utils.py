@@ -1,6 +1,7 @@
 """BigQuery loading utilities with staging table + load job deduplication"""
 
 import json
+import os
 import tempfile
 import time
 import logging
@@ -68,6 +69,7 @@ def load_to_bigquery(
         with open(temp_path, 'rb') as f:
             load_job = client.load_table_from_file(f, staging_id, job_config=job_config)
             load_job.result()
+        os.unlink(temp_path)
 
         staging_rows = load_job.output_rows
         logger.info(f"Loaded {staging_rows} rows into staging table")
@@ -158,6 +160,7 @@ def load_dimension_to_bigquery(
         with open(temp_path, 'rb') as f:
             load_job = client.load_table_from_file(f, table_id, job_config=job_config)
             load_job.result()
+        os.unlink(temp_path)
 
         rows_loaded = load_job.output_rows
         logger.info(f"Dimension refresh: {rows_loaded} rows loaded to {table_name}")

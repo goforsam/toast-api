@@ -265,4 +265,4 @@ def config_weekly(request):
 
 
 def _error_response(message):
-    return json.dumps({'status': 'error', 'error': message}), {'Content-Type': 'application/json'}
+    return json.dumps({'status': 'error', 'error': message})
